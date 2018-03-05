@@ -9,7 +9,6 @@ package main
 
 import (
 	"bytes"
-	"encoding/csv"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -503,7 +502,17 @@ func kvList(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	log.Infof("config for id %x", id.ID)
+	// only print value for the given key
+	if c.String("key") != "" {
+		val, ok := id.Data.Storage[c.String("key")]
+		if !ok {
+			return errors.New("key does not exists")
+		}
+		fmt.Println(val)
+		return nil
+	}
+
+	// print everything
 	for k, v := range id.Data.Storage {
 		log.Infof("%s: %s", k, v)
 	}
@@ -551,37 +560,36 @@ func kvAdd(c *cli.Context) error {
 	return addKv(c, cfg, id, prop)
 }
 
-// kvAddCsv reads the input CSV file, lookup its key column and inputs all the
-// csv file at once to the skipchain. The key is given from the "column" args
-// and the value is the whole full row, unmodified.
-func kvAddCsv(c *cli.Context) error {
+// kvAddFile reads the input file, and stores it in the data. The key is the
+// name of the file by default or overridden by the key flag. Do not use with
+// big files as it reads all at once.
+func kvAddFile(c *cli.Context) error {
 	cfg := loadConfigOrFail(c)
-	if c.NArg() != 1 {
-		return errors.New("Missing argument: csv file")
+	if c.NArg() < 1 {
+		return errors.New("Missing argument: file name")
 	}
 	id, err := cfg.findSC(c.Args().Get(1))
 	if err != nil {
 		scList(c)
 		return errors.New("Please give skipchain-id")
 	}
+	// read file name
 	file := c.Args().First()
+	// determine the key
+	key := path.Base(file)
+	if c.String("key") != "" {
+		key = c.String("key")
+	}
+	// read file
 	fd, err := os.Open(file)
 	log.ErrFatal(err)
-	reader := csv.NewReader(fd)
-	records, err := reader.ReadAll()
+	buff, err := ioutil.ReadAll(fd)
 	log.ErrFatal(err)
-	if len(records) < 2 {
-		return errors.New("csv file given only contains column name")
-	}
-	column := c.Int("column")
-	log.Info("Column names to insert in cisc: " + strings.Join(records[0], ":"))
-	log.Info("Column name to use as a key: " + records[0][column])
+
+	// store it
+	log.Info("File will be stored under key: " + key)
 	prop := id.GetProposed()
-	for _, row := range records[1:] {
-		key := row[column]
-		value := strings.Join(row, ",")
-		prop.Storage[key] = value
-	}
+	prop.Storage[key] = string(buff)
 	return addKv(c, cfg, id, prop)
 }
 
@@ -597,7 +605,7 @@ func addKv(c *cli.Context, cfg *ciscConfig, id *identity.Identity, prop *identit
 }
 func kvDel(c *cli.Context) error {
 	cfg := loadConfigOrFail(c)
-	if c.NArg() < 1 {
+	if c.NArg() != 1 {
 		return errors.New("Please give a key to delete")
 	}
 	id, err := cfg.findSC(c.Args().Get(1))
@@ -844,6 +852,10 @@ func followDel(c *cli.Context) error {
 func followList(c *cli.Context) error {
 	cfg := loadConfigOrFail(c)
 	for _, id := range cfg.Follow {
+		if c.Bool("id-only") {
+			fmt.Printf("%x\n", id.ID)
+			continue
+		}
 		log.Infof("SCID: %x", id.ID)
 		server := id.DeviceName
 		log.Infof("Server %s is asked to accept ssh-keys from %s:",
@@ -860,224 +872,5 @@ func followUpdate(c *cli.Context) error {
 		}
 	}
 	cfg.writeAuthorizedKeys(c)
-	return cfg.saveConfig(c)
-}
-
-/*
- * Commands related to the certificate store/retrieve
- */
-
-//Request a Certificate to Letsencrypt Ca and store it.
-func certRequest(c *cli.Context) error {
-	cfg := loadConfigOrFail(c)
-	if c.NArg() < 1 {
-		log.Fatal("Please give a domain name ")
-	}
-	domain := c.Args().Get(0)
-
-	//Request Certificate (see certificate.go)
-	cert := getCert(domain)
-	//check the validity of the certificate(see certificate.go)
-	log.Print("Verify the validity of the cert:")
-	if !check(cert) {
-		log.Fatal("Certificate not valid, can't add it to proposal storage ")
-	}
-
-	id, err := cfg.findSC(c.Args().Get(1))
-	if err != nil {
-		return err
-	}
-	if id == nil {
-		scList(c)
-		return errors.New("Please give skipchain-id")
-	}
-
-	prop := id.GetProposed()
-	log.Print("Valid Certificate, added to proposal storage")
-	prop.Storage[domain] = cert
-	//send the certificate to proposal
-	cfg.proposeSendVoteUpdate(id, prop)
-	return cfg.saveConfig(c)
-}
-
-//List only the certificate
-func certList(c *cli.Context) error {
-	cfg := loadConfigOrFail(c)
-
-	id, err := cfg.findSC(c.Args().First())
-	if err != nil {
-		return err
-	}
-	if id == nil {
-		scList(c)
-		return errors.New("Please give skipchain-id")
-	}
-
-	log.Infof("config for id %x", id.ID)
-	for k, v := range id.Data.Storage {
-		if isCert(v) {
-			log.Infof("%s: %s", k, v)
-		}
-	}
-	return nil
-}
-
-//Store a cert without request it
-func certStore(c *cli.Context) error {
-	cfg := loadConfigOrFail(c)
-	if c.NArg() < 2 {
-		log.Fatal("Please give a key cert pair")
-	}
-	domain := c.Args().Get(0)
-	cert := c.Args().Get(1)
-	//check the validity of the certificate
-	if !isCert(cert) {
-		log.Fatal("Please give a cert")
-	}
-	log.Print("Verify the validity of the cert:")
-	if !check(cert) {
-		log.Fatal("Certificate not valid, can't add it to proposal storage ")
-	}
-
-	id, err := cfg.findSC(c.Args().Get(2))
-	if err != nil {
-		return err
-	}
-	if id == nil {
-		scList(c)
-		return errors.New("Please give skipchain-id")
-	}
-
-	prop := id.GetProposed()
-	log.Print("Valid Certificate, added to proposal storage")
-	prop.Storage[domain] = cert
-	cfg.proposeSendVoteUpdate(id, prop)
-	return cfg.saveConfig(c)
-}
-
-//check a certificate
-func certVerify(c *cli.Context) error {
-	if c.NArg() < 1 {
-		log.Fatal("Please give the corresponding domain to verify the certificate")
-	}
-	cfg := loadConfigOrFail(c)
-	id, err := cfg.findSC(c.Args().Get(1))
-	if err != nil {
-		return err
-	}
-	if id == nil {
-		scList(c)
-		return errors.New("Please give skipchain-id")
-	}
-
-	k := c.Args().Get(0)
-
-	cert := id.Data.Storage[k]
-
-	if !isCert(cert) {
-		log.Fatal("The values are not a certificate")
-	}
-	log.Print("Verify the validity of the cert:")
-	check(cert)
-	return cfg.saveConfig(c)
-}
-
-func certRenew(c *cli.Context) error {
-	cfg := loadConfigOrFail(c)
-	if c.NArg() < 1 {
-		log.Fatal("Please give a domain name")
-	}
-	domain := c.Args().Get(0)
-	id, err := cfg.findSC(c.Args().Get(1))
-	if err != nil {
-		return err
-	}
-	if id == nil {
-		scList(c)
-		return errors.New("Please give skipchain-id")
-	}
-
-	if _, ok := id.Data.Storage[domain]; !ok {
-		log.Fatal("Didn't find key", domain, "in the config")
-	}
-
-	cert := id.Data.Storage[domain]
-	if !isCert(cert) {
-		log.Fatal("The values is not a certificate")
-	}
-	//renew the cert (see certificate.go)
-	newcert := renewCert(cert)
-	//check the certificate
-	log.Print("Verify the validity of the cert:")
-	if !check(newcert) {
-		log.Fatal("Certificate is not valid, can't add it to proposal storage ")
-	}
-	prop := id.GetProposed()
-	log.Print("Valid Certificate, added to proposal storage")
-	prop.Storage[domain] = newcert
-	cfg.proposeSendVoteUpdate(id, prop)
-	return cfg.saveConfig(c)
-}
-
-func certRevoke(c *cli.Context) error {
-	cfg := loadConfigOrFail(c)
-	if c.NArg() < 1 {
-		log.Fatal("Please give the domain to delete the certificate")
-	}
-
-	id, err := cfg.findSC(c.Args().Get(1))
-	if err != nil {
-		return err
-	}
-	if id == nil {
-		scList(c)
-		return errors.New("Please give skipchain-id")
-	}
-
-	key := c.Args().First()
-	prop := id.GetProposed()
-	if _, ok := prop.Storage[key]; !ok {
-		log.Fatal("Didn't find key", key, "in the config")
-	}
-	cert, _ := prop.Storage[key]
-	if !isCert(cert) {
-		log.Fatal("The values are not a certificate")
-	}
-	//revoke the certificate (see certificate.go)
-	revokeCert(cert)
-	delete(prop.Storage, key)
-	cfg.proposeSendVoteUpdate(id, prop)
-	return cfg.saveConfig(c)
-}
-
-func certRetrieve(c *cli.Context) error {
-	if c.NArg() < 1 {
-		log.Fatal("Please give the domain to retrieve the cert")
-	}
-	k := c.Args().Get(0)
-	cfg := loadConfigOrFail(c)
-	id, err := cfg.findSC(c.Args().Get(1))
-	if err != nil {
-		return err
-	}
-	if id == nil {
-		scList(c)
-		return errors.New("Please give skipchain-id")
-	}
-
-	cert := id.Data.Storage[k]
-	if cert == "" {
-		log.Fatal("Cisc don't store a certificate for this domain ")
-	}
-	if !isCert(cert) {
-		log.Fatal("the values stores in ths key/values pair is not a certificate")
-	}
-	log.Print("Verify the validity of the cert:")
-	if !check(cert) {
-		log.Fatal("Certificate not valid, can't add it to proposal storage ")
-	}
-
-	log.Info("Valid certificate, Retrive it to: " + k + ".pem")
-	ioutil.WriteFile(k+".pem", []byte(cert), 0644)
 	return cfg.saveConfig(c)
 }
