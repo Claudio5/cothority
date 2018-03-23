@@ -5,7 +5,7 @@ const UUID = require("pure-uuid");
 const protobuf = require("protobufjs");
 const co = require("co");
 const shuffle = require("crypto-shuffle");
-const WebSocket = require("isomorphic-ws");
+const WS = require("ws");
 
 const root = require("../protobuf/index.js").root;
 const identity = require("../identity.js");
@@ -36,7 +36,7 @@ function Socket(addr, service) {
     return new Promise((resolve, reject) => {
       const path = this.url + "/" + request;
       console.log("net.Socket: new WebSocket(" + path + ")");
-      const ws = new WebSocket(this.url + "/" + request);
+      const ws = new WS(this.url + "/" + request);
       ws.binaryType = "arraybuffer";
 
       const requestModel = this.protobuf.lookup(request);
@@ -47,6 +47,18 @@ function Socket(addr, service) {
       if (responseModel === undefined)
         reject(new Error("Model " + response + " not found"));
 
+      // This makes the API consistent with nativescript-websockets
+      if (typeof ws.open === "function") {
+        ws._notify = ws._notifyBrowser;
+        Object.defineProperty(WS.prototype, "_notify", {
+          enumerable: false
+        });
+
+        Object.defineProperty(ws, "_notify", { enumerable: false });
+
+        ws.open();
+      }
+
       ws.onopen = () => {
         const message = requestModel.create(data);
         const marshal = requestModel.encode(message).finish();
@@ -55,7 +67,18 @@ function Socket(addr, service) {
 
       ws.onmessage = event => {
         ws.close();
-        const buffer = new Uint8Array(event.data);
+        const { data } = event;
+        let buffer;
+        if (ws.android) {
+          data.rewind();
+          const len = data.limit();
+          buffer = new Uint8Array(len);
+          for (let i = 0; i < len; i++) {
+            buffer[i] = data.get(i);
+          }
+        } else {
+          buffer = new Uint8Array(data);
+        }
         const unmarshal = responseModel.decode(buffer);
         resolve(unmarshal);
       };
