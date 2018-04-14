@@ -49,8 +49,6 @@ KOqkqm57TH2H3eDJAkSnh6/DNFu0Qg==
 // LetsEncryptURL is the URL needed to create a new client
 const LetsEncryptURL = "https://acme-v01.api.letsencrypt.org/directory"
 
-//const LetsEncryptURL = "https://acme-staging-v02.api.letsencrypt.org/directory"
-
 // Convert a certificate of type string into certificate of type x509.Certificate
 func pemToCertificate(certPem []byte) (*x509.Certificate, error) {
 	block, _ := pem.Decode(certPem)
@@ -160,7 +158,7 @@ func revokeCert(path string, cert []byte) error {
 // completing a challenge then it returns the certificate as string type
 func getCert(wwwDir string, certDir string, domain string) ([]byte, error) {
 	certPath := path.Join(certDir, domain)
-
+  
 	// Create a client to the acme of letsencrypt.
 	log.Info("Requesting RSA keys")
 	cli, err := letsencrypt.NewClient(LetsEncryptURL)
