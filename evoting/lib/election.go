@@ -1,6 +1,7 @@
 package lib
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/dedis/kyber"
@@ -30,9 +31,9 @@ func init() {
 // in the second skipblock right after the (empty) genesis block. A reference
 // to the election skipchain is appended to the master skipchain upon opening.
 type Election struct {
-	Name    string   // Name of the election.
-	Creator uint32   // Creator is the election responsible.
-	Users   []uint32 // Users is the list of registered voters.
+	Name    map[string]string // Name of the election. lang-code, value pair
+	Creator uint32            // Creator is the election responsible.
+	Users   []uint32          // Users is the list of registered voters.
 
 	ID        skipchain.SkipBlockID // ID is the hash of the genesis block.
 	Master    skipchain.SkipBlockID // Master is the hash of the master skipchain.
@@ -41,15 +42,17 @@ type Election struct {
 	MasterKey kyber.Point           // MasterKey is the front-end public key.
 	Stage     ElectionState         // Stage indicates the phase of election and is used for filtering in frontend
 
-	Candidates []uint32 // Candidates is the list of candidate scipers.
-	MaxChoices int      // MaxChoices is the max votes in allowed in a ballot.
-	Subtitle   string   // Description in string format.
-	MoreInfo   string   // MoreInfo is the url to AE Website for the given election.
-	Start      int64    // Start denotes the election start unix timestamp
-	End        int64    // End (termination) datetime as unix timestamp.
+	Candidates []uint32          // Candidates is the list of candidate scipers.
+	MaxChoices int               // MaxChoices is the max votes in allowed in a ballot.
+	Subtitle   map[string]string // Description in string format. lang-code, value pair
+	MoreInfo   string            // MoreInfo is the url to AE Website for the given election.
+	Start      int64             // Start denotes the election start unix timestamp
+	End        int64             // End (termination) datetime as unix timestamp.
 
 	Theme  string // Theme denotes the CSS class for selecting background color of card title.
 	Footer footer // Footer denotes the Election footer
+
+	Voted skipchain.SkipBlockID // Voted denotes if a user has already cast a ballot for this election.
 }
 
 // footer denotes the fields for the election footer
@@ -61,10 +64,12 @@ type footer struct {
 }
 
 // GetElection fetches the election structure from its skipchain and sets the stage.
-func GetElection(roster *onet.Roster, id skipchain.SkipBlockID) (*Election, error) {
-	client := skipchain.NewClient()
+func GetElection(s *skipchain.Service, id skipchain.SkipBlockID,
+	checkVoted bool, user uint32) (*Election, error) {
 
-	block, err := client.GetSingleBlockByIndex(roster, id, 1)
+	block, err := s.GetSingleBlockByIndex(
+		&skipchain.GetSingleBlockByIndex{Genesis: id, Index: 1},
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -75,39 +80,83 @@ func GetElection(roster *onet.Roster, id skipchain.SkipBlockID) (*Election, erro
 		return nil, fmt.Errorf("no election structure in %s", id.Short())
 	}
 	election := transaction.Election
-	err = election.setStage()
+	err = election.setStage(s)
 	if err != nil {
 		return nil, err
+	}
+	// check for voted only if required. We cache things in localStorage
+	// on the frontend
+	if checkVoted {
+		err = election.setVoted(s, user)
 	}
 	return election, nil
 }
 
-func (e *Election) setStage() error {
-	mixes, err := e.Mixes()
-	if err != nil {
-		return err
+// setVoted sets the Voted field of the election to the skipblock id
+// of the last ballot cast by the user
+func (e *Election) setVoted(s *skipchain.Service, user uint32) error {
+	db := s.GetDB()
+	block := db.GetByID(e.ID)
+	if block == nil {
+		return errors.New("Election skipchain empty")
 	}
 
-	partials, err := e.Partials()
-	if err != nil {
-		return err
-	}
-
-	if len(mixes) == 0 {
-		e.Stage = Running
-	} else if len(partials) == len(e.Roster.List) {
-		e.Stage = Decrypted
-	} else {
-		e.Stage = Shuffled
+	for {
+		transaction := UnmarshalTransaction(block.Data)
+		if transaction == nil {
+			if len(block.ForwardLink) == 0 {
+				break
+			}
+			block = db.GetByID(block.ForwardLink[0].To)
+			continue
+		}
+		if transaction.Ballot != nil && transaction.User == user {
+			e.Voted = block.Hash
+		}
+		if transaction.Mix != nil || transaction.Partial != nil {
+			break
+		}
+		if len(block.ForwardLink) == 0 {
+			break
+		}
+		block = db.GetByID(block.ForwardLink[0].To)
 	}
 	return nil
 }
 
-// Box accumulates all the ballots while only keeping the last ballot for each user.
-func (e *Election) Box() (*Box, error) {
-	client := skipchain.NewClient()
+func (e *Election) setStage(s *skipchain.Service) error {
+	// threshold is the minimum number of blocks we need
+	// to complete a shuffle or a decryption. Following
+	// byzantine consensus it's set to floor(2*n/3) + 1
+	threshold := 2*len(e.Roster.List)/3 + 1
+	partials, err := e.Partials(s)
+	if err != nil {
+		return err
+	}
+	if len(partials) >= threshold {
+		e.Stage = Decrypted
+		return nil
+	}
 
-	block, err := client.GetSingleBlockByIndex(e.Roster, e.ID, 0)
+	mixes, err := e.Mixes(s)
+	if err != nil {
+		return err
+	}
+	if len(mixes) >= threshold {
+		e.Stage = Shuffled
+		return nil
+	}
+	e.Stage = Running
+	return nil
+}
+
+// Box accumulates all the ballots while only keeping the last ballot for each user.
+func (e *Election) Box(s *skipchain.Service) (*Box, error) {
+	block, err := s.GetSingleBlockByIndex(
+		&skipchain.GetSingleBlockByIndex{
+			Genesis: e.ID,
+			Index:   0,
+		})
 	if err != nil {
 		return nil, err
 	}
@@ -123,7 +172,10 @@ func (e *Election) Box() (*Box, error) {
 		if len(block.ForwardLink) <= 0 {
 			break
 		}
-		block, _ = client.GetSingleBlock(e.Roster, block.ForwardLink[0].To)
+		block, _ = s.GetSingleBlock(
+			&skipchain.GetSingleBlock{
+				ID: block.ForwardLink[0].To,
+			})
 	}
 
 	// Reverse ballot list
@@ -149,49 +201,92 @@ func (e *Election) Box() (*Box, error) {
 }
 
 // Mixes returns all mixes created by the roster conodes.
-func (e *Election) Mixes() ([]*Mix, error) {
-	client := skipchain.NewClient()
+func (e *Election) Mixes(s *skipchain.Service) ([]*Mix, error) {
 
-	block, err := client.GetSingleBlockByIndex(e.Roster, e.ID, 0)
+	// Traversing forward one by one might be expensive in a large
+	// election. It's better to search for the Mix transactions
+	// from the end of the skipchain
+	block, err := s.GetDB().GetLatest(s.GetDB().GetByID(e.ID))
 	if err != nil {
 		return nil, err
 	}
 
 	mixes := make([]*Mix, 0)
-	for {
+	for block != nil {
 		transaction := UnmarshalTransaction(block.Data)
-		if transaction != nil && transaction.Mix != nil {
+		if transaction == nil {
+			if len(block.BackLinkIDs) == 0 {
+				break
+			}
+			block = s.GetDB().GetByID(block.BackLinkIDs[0])
+			continue
+		}
+		if transaction.Mix == nil && transaction.Partial == nil {
+			// we're done
+			break
+		}
+
+		if transaction.Mix != nil {
+			// append to the mixes array
 			mixes = append(mixes, transaction.Mix)
 		}
 
-		if len(block.ForwardLink) <= 0 {
+		if len(block.BackLinkIDs) == 0 {
 			break
 		}
-		block, _ = client.GetSingleBlock(e.Roster, block.ForwardLink[0].To)
+
+		// keep iterating back
+		block = s.GetDB().GetByID(block.BackLinkIDs[0])
+	}
+	// reverse the slice since we iterated in reverse before
+	for i := len(mixes)/2 - 1; i >= 0; i-- {
+		opp := len(mixes) - 1 - i
+		mixes[i], mixes[opp] = mixes[opp], mixes[i]
 	}
 	return mixes, nil
 }
 
 // Partials returns the partial decryption for each roster conode.
-func (e *Election) Partials() ([]*Partial, error) {
-	client := skipchain.NewClient()
+func (e *Election) Partials(s *skipchain.Service) ([]*Partial, error) {
 
-	block, err := client.GetSingleBlockByIndex(e.Roster, e.ID, 0)
+	// Traversing forward one by one might be expensive in a large
+	// election. It's better to search for the Partial transactions
+	// from the end of the skipchain
+	block, err := s.GetDB().GetLatest(s.GetDB().GetByID(e.ID))
 	if err != nil {
 		return nil, err
 	}
 
 	partials := make([]*Partial, 0)
-	for {
+	for block != nil {
 		transaction := UnmarshalTransaction(block.Data)
-		if transaction != nil && transaction.Partial != nil {
+		if transaction == nil {
+			if len(block.BackLinkIDs) == 0 {
+				break
+			}
+			block = s.GetDB().GetByID(block.BackLinkIDs[0])
+			continue
+		}
+		if transaction.Partial == nil {
+			// we're done
+			break
+		}
+
+		if transaction.Partial != nil {
 			partials = append(partials, transaction.Partial)
 		}
 
-		if len(block.ForwardLink) <= 0 {
+		if len(block.BackLinkIDs) == 0 {
 			break
 		}
-		block, _ = client.GetSingleBlock(e.Roster, block.ForwardLink[0].To)
+
+		// keep iterating back
+		block = s.GetDB().GetByID(block.BackLinkIDs[0])
+	}
+	// reverse the slice since we iterated in reverse before
+	for i := len(partials)/2 - 1; i >= 0; i-- {
+		opp := len(partials) - 1 - i
+		partials[i], partials[opp] = partials[opp], partials[i]
 	}
 	return partials, nil
 }

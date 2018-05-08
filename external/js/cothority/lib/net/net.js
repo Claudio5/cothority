@@ -148,5 +148,57 @@ class RosterSocket {
   }
 }
 
-module.exports.Socket = Socket;
-module.exports.RosterSocket = RosterSocket;
+/**
+ * LeaderSocket reads a roster and can be used to communicate with the leader
+ * node. As of now the leader is the first node in the roster.
+ *
+ * @throws {Error} when roster doesn't have any node
+ */
+class LeaderSocket {
+  constructor(roster, service) {
+    this.service = service;
+    this.roster = roster;
+
+    if (this.roster.identities.length === 0) {
+      throw new Error("Roster should have atleast one node");
+    }
+  }
+
+  /**
+   * Send transmits data to a given url and parses the response.
+   * @param {string} request name of registered protobuf message
+   * @param {string} response name of registered protobuf message
+   * @param {object} data to be sent
+   *
+   * @returns {Promise} with response message on success and error on failure.
+   */
+  send(request, response, data) {
+    // fn is a generator that tries the sending the request to the leader
+    // maximum 3 times and returns on the first successful attempt
+    const that = this;
+    const fn = co.wrap(function*() {
+      for (let i = 0; i < 3; i++) {
+        try {
+          const socket = new Socket(
+            that.roster.identities[0].websocketAddr,
+            that.service
+          );
+          const reply = yield socket.send(request, response, data);
+          return Promise.resolve(reply);
+        } catch (e) {
+          console.error("error sending request: ", e.message);
+        }
+      }
+      return Promise.reject(
+        new Error("couldn't send request after 3 attempts")
+      );
+    });
+    return fn();
+  }
+}
+
+module.exports = {
+  Socket,
+  RosterSocket,
+  LeaderSocket
+};

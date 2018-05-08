@@ -16,10 +16,12 @@ import (
 	"bufio"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path"
+	"reflect"
 	"strings"
 
 	"github.com/dedis/cothority"
@@ -46,12 +48,17 @@ const (
 	Version = "2.0"
 )
 
-func main() {
+var gitTag = ""
 
+func main() {
 	cliApp := cli.NewApp()
 	cliApp.Name = DefaultName
 	cliApp.Usage = "run a cothority server"
-	cliApp.Version = Version
+	if gitTag == "" {
+		cliApp.Version = Version
+	} else {
+		cliApp.Version = Version + "-" + gitTag
+	}
 
 	cliApp.Commands = []cli.Command{
 		{
@@ -121,6 +128,16 @@ func main() {
 		return nil
 	}
 
+	// Do not allow conode to run when built in 32-bit mode.
+	// The dedis/protobuf package is the origin of this limit.
+	// Instead of getting the error later from protobuf and being
+	// confused, just make it totally clear up-front.
+	var i int
+	iType := reflect.TypeOf(i)
+	if iType.Size() < 8 {
+		log.ErrFatal(errors.New("conode cannot run when built in 32-bit mode"))
+	}
+
 	err := cliApp.Run(os.Args)
 	log.ErrFatal(err)
 }
@@ -138,6 +155,9 @@ func checkConfig(c *cli.Context) error {
 	tomlFileName := c.String("g")
 	if c.NArg() > 0 {
 		tomlFileName = c.Args().First()
+	}
+	if tomlFileName == "" {
+		log.Fatal("[-] Must give the roster file to check.")
 	}
 	return check.Config(tomlFileName, c.Bool("detail"))
 }

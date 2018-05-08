@@ -42,10 +42,13 @@ type LookupSciperReply struct {
 
 // Link message.
 type Link struct {
-	Pin    string       // Pin of the running service.
-	Roster *onet.Roster // Roster that handles elections.
-	Key    kyber.Point  // Key is a front-end public key.
-	Admins []uint32     // Admins is a list of election administrators.
+	Pin       string                 // Pin of the running service.
+	Roster    *onet.Roster           // Roster that handles elections.
+	Key       kyber.Point            // Key is a front-end public key.
+	Admins    []uint32               // Admins is a list of election administrators.
+	ID        *skipchain.SkipBlockID // ID of the master skipchain to update; optional.
+	User      *uint32                // User identifier; optional (required with ID).
+	Signature *[]byte                // Signature authenticating the message; optional (required with ID).
 }
 
 // LinkReply message.
@@ -78,7 +81,9 @@ type Cast struct {
 }
 
 // CastReply message.
-type CastReply struct{}
+type CastReply struct {
+	ID skipchain.SkipBlockID // Hash of the block storing the transaction
+}
 
 // Shuffle message.
 type Shuffle struct {
@@ -104,14 +109,18 @@ type DecryptReply struct{}
 
 // GetElections message.
 type GetElections struct {
-	User   uint32                // User identifier.
-	Master skipchain.SkipBlockID // Master skipchain ID.
-	Stage  lib.ElectionState     // Election Stage filter. 0 for all elections.
+	User       uint32                // User identifier.
+	Master     skipchain.SkipBlockID // Master skipchain ID.
+	Stage      lib.ElectionState     // Election Stage filter. 0 for all elections.
+	Signature  []byte                // Signature authenticating the message.
+	CheckVoted bool                  // Check if user has voted in the elections.
 }
 
 // GetElectionsReply message.
 type GetElectionsReply struct {
 	Elections []*lib.Election // Elections is the retrieved list of elections.
+	IsAdmin   bool            // Is the user in the list of admins in the master?
+	Master    lib.Master
 }
 
 // GetBox message.

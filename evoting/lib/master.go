@@ -1,7 +1,7 @@
 package lib
 
 import (
-	"fmt"
+	"errors"
 
 	"github.com/dedis/kyber"
 	"github.com/dedis/onet"
@@ -33,26 +33,37 @@ type Link struct {
 }
 
 // GetMaster retrieves the master object from its skipchain.
-func GetMaster(roster *onet.Roster, id skipchain.SkipBlockID) (*Master, error) {
-	client := skipchain.NewClient()
-
-	block, err := client.GetSingleBlockByIndex(roster, id, 1)
+func GetMaster(s *skipchain.Service, id skipchain.SkipBlockID) (*Master, error) {
+	// Search backwards from the end of the chain, unmarshalling each block until
+	// we find the first Master transaction. (There are Link transactions mixed in
+	// with the Masters.)
+	gb := s.GetDB().GetByID(id)
+	if gb == nil {
+		return nil, errors.New("No such genesis-block")
+	}
+	block, err := s.GetDB().GetLatest(gb)
 	if err != nil {
 		return nil, err
 	}
 
-	transaction := UnmarshalTransaction(block.Data)
-	if transaction == nil && transaction.Master == nil {
-		return nil, fmt.Errorf("no master structure in %s", id.Short())
+	for block != nil && len(block.BackLinkIDs) != 0 {
+		transaction := UnmarshalTransaction(block.Data)
+		if transaction == nil {
+			continue
+		}
+		if transaction.Master != nil {
+			return transaction.Master, nil
+		}
+		block = s.GetDB().GetByID(block.BackLinkIDs[0])
 	}
-	return transaction.Master, nil
+	return nil, errors.New("could not find master")
 }
 
 // Links returns all the links appended to the master skipchain.
-func (m *Master) Links() ([]*Link, error) {
-	client := skipchain.NewClient()
-
-	block, err := client.GetSingleBlockByIndex(m.Roster, m.ID, 0)
+func (m *Master) Links(s *skipchain.Service) ([]*Link, error) {
+	block, err := s.GetSingleBlockByIndex(
+		&skipchain.GetSingleBlockByIndex{Genesis: m.ID, Index: 0},
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -67,7 +78,9 @@ func (m *Master) Links() ([]*Link, error) {
 		if len(block.ForwardLink) <= 0 {
 			break
 		}
-		block, _ = client.GetSingleBlock(m.Roster, block.ForwardLink[0].To)
+		block, _ = s.GetSingleBlock(
+			&skipchain.GetSingleBlock{ID: block.ForwardLink[0].To},
+		)
 	}
 	return links, nil
 }

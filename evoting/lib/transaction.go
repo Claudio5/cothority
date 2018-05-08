@@ -2,11 +2,12 @@ package lib
 
 import (
 	"errors"
+	"fmt"
 	"strconv"
 	"time"
 
+	"github.com/dedis/kyber"
 	"github.com/dedis/kyber/sign/schnorr"
-	"github.com/dedis/onet"
 	"github.com/dedis/onet/network"
 	"github.com/dedis/protobuf"
 
@@ -78,18 +79,20 @@ func NewTransaction(data interface{}, user uint32, signature []byte) *Transactio
 }
 
 // Digest appends the digits of sciper to master genesis skipblock ID
-func (t *Transaction) Digest(roster *onet.Roster, genesis skipchain.SkipBlockID) []byte {
-	var election *Election
-	if t.Election != nil {
-		election = t.Election
-	} else {
-		election, _ = GetElection(roster, genesis)
+func (t *Transaction) Digest(s *skipchain.Service, genesis skipchain.SkipBlockID) []byte {
+	var message []byte
+	switch {
+	case t.Master != nil:
+		message = t.Master.ID
+	case t.Election != nil:
+		message = t.Election.Master
+	default:
+		election, _ := GetElection(s, genesis, false, t.User)
+		if election == nil {
+			return nil
+		}
+		message = election.Master
 	}
-	// Master or Link transaction
-	if election == nil {
-		return nil
-	}
-	message := election.Master
 	for _, c := range strconv.Itoa(int(t.User)) {
 		d, _ := strconv.Atoi(string(c))
 		message = append(message, byte(d))
@@ -98,12 +101,46 @@ func (t *Transaction) Digest(roster *onet.Roster, genesis skipchain.SkipBlockID)
 }
 
 // Verify checks that the corresponding transaction is valid before storing it.
-func (t *Transaction) Verify(genesis skipchain.SkipBlockID, roster *onet.Roster) error {
-	digest := t.Digest(roster, genesis)
+func (t *Transaction) Verify(genesis skipchain.SkipBlockID, s *skipchain.Service) error {
+	digest := t.Digest(s, genesis)
 	if t.Master != nil {
+		// Find the current master in order to compare against it.
+		m, err := GetMaster(s, genesis)
+		if err != nil {
+			// This chain does not exist, yet. Allow it to be created.
+			return nil
+		}
+
+		err = schnorr.Verify(cothority.Suite, m.Key, digest, t.Signature)
+		if err != nil {
+			return err
+		}
+		if !m.IsAdmin(t.User) {
+			return errors.New("current user was not in previous admin list")
+		}
+
+		// Changing this would not make any sense.
+		if !t.Master.ID.Equal(m.ID) {
+			return errors.New("mismatched ID in master update")
+		}
+
+		// All the other fields (admin list, roster, and front end key) may change, but
+		// let's apply some sanity checks to them.
+
+		if len(t.Master.Admins) == 0 {
+			return errors.New("empty admin list in master update")
+		}
+		if len(t.Master.Roster.List) == 0 {
+			return errors.New("empty roster in master update")
+		}
+		null := t.Master.Key.Clone().Null()
+		if t.Master.Key.Equal(null) {
+			return errors.New("null key in master update")
+		}
+
 		return nil
 	} else if t.Link != nil {
-		master, err := GetMaster(roster, genesis)
+		master, err := GetMaster(s, genesis)
 		if err != nil {
 			return err
 		}
@@ -122,7 +159,7 @@ func (t *Transaction) Verify(genesis skipchain.SkipBlockID, roster *onet.Roster)
 			return errors.New("open error: invalid end date")
 		}
 
-		master, err := GetMaster(roster, election.Master)
+		master, err := GetMaster(s, election.Master)
 		if err != nil {
 			return err
 		}
@@ -131,7 +168,7 @@ func (t *Transaction) Verify(genesis skipchain.SkipBlockID, roster *onet.Roster)
 		}
 		return nil
 	} else if t.Ballot != nil {
-		election, err := GetElection(roster, genesis)
+		election, err := GetElection(s, genesis, false, t.User)
 		if err != nil {
 			return err
 		}
@@ -140,17 +177,25 @@ func (t *Transaction) Verify(genesis skipchain.SkipBlockID, roster *onet.Roster)
 			return err
 		}
 
-		mixes, err := election.Mixes()
+		// t.User is trusted at this point, so make sure that they did not try to sneak
+		// through a different user-id in the ballot.
+		if t.User != t.Ballot.User {
+			return errors.New("ballot user-id differs from transaction user-id")
+		}
+
+		latest, err := s.GetDB().GetLatest(s.GetDB().GetByID(election.ID))
+		transaction := UnmarshalTransaction(latest.Data)
 		if err != nil {
 			return err
-		} else if len(mixes) > 0 {
+		}
+		if transaction.Mix != nil || transaction.Partial != nil {
 			return errors.New("cast error: election not in running stage")
 		} else if !election.IsUser(t.User) {
 			return errors.New("cast error: user not part")
 		}
 		return nil
 	} else if t.Mix != nil {
-		election, err := GetElection(roster, genesis)
+		election, err := GetElection(s, genesis, false, t.User)
 		if err != nil {
 			return err
 		}
@@ -158,18 +203,66 @@ func (t *Transaction) Verify(genesis skipchain.SkipBlockID, roster *onet.Roster)
 		if err != nil {
 			return err
 		}
-
-		mixes, err := election.Mixes()
-		if err != nil {
-			return err
-		} else if len(mixes) == len(roster.List) {
-			return errors.New("shuffle error: election already shuffled")
-		} else if !election.IsCreator(t.User) {
+		if !election.IsCreator(t.User) {
 			return errors.New("shuffle error: user is not election creator")
 		}
+
+		// verify proposer
+		_, proposer := election.Roster.Search(t.Mix.NodeID)
+		if proposer == nil {
+			return errors.New("didn't find signer in mix")
+		}
+		data, err := proposer.Public.MarshalBinary()
+		if err != nil {
+			return err
+		}
+		err = schnorr.Verify(cothority.Suite, proposer.Public, data, t.Mix.Signature)
+		if err != nil {
+			return err
+		}
+
+		mixes, err := election.Mixes(s)
+		if err != nil {
+			return err
+		}
+
+		if len(mixes) > 2*len(election.Roster.List)/3 {
+			return errors.New("shuffle error: election already shuffled")
+		}
+
+		for _, mix := range mixes {
+			_, mixProposer := election.Roster.Search(mix.NodeID)
+			if mixProposer == nil {
+				return errors.New("didn't find signer in mix")
+			}
+
+			if mixProposer.Public.Equal(proposer.Public) {
+				return fmt.Errorf("%s has already proposed a shuffle", mixProposer)
+			}
+		}
+
+		// check if Mix is valid
+		var x, y []kyber.Point
+		if len(mixes) == 0 {
+			// verify against Boxes
+			boxes, err := election.Box(s)
+			if err != nil {
+				return err
+			}
+			x, y = Split(boxes.Ballots)
+		} else {
+			// verify against the last mix
+			x, y = Split(mixes[len(mixes)-1].Ballots)
+		}
+		v, w := Split(t.Mix.Ballots)
+		err = Verify(t.Mix.Proof, election.Key, x, y, v, w)
+		if err != nil {
+			return err
+		}
+
 		return nil
 	} else if t.Partial != nil {
-		election, err := GetElection(roster, genesis)
+		election, err := GetElection(s, genesis, false, t.User)
 		if err != nil {
 			return err
 		}
@@ -177,21 +270,41 @@ func (t *Transaction) Verify(genesis skipchain.SkipBlockID, roster *onet.Roster)
 		if err != nil {
 			return err
 		}
-
-		mixes, err := election.Mixes()
-		if err != nil {
-			return err
-		} else if len(mixes) != len(roster.List) {
-			return errors.New("decrypt error, election not shuffled yet")
+		if !election.IsCreator(t.User) {
+			return errors.New("decrypt error: user is not election creator")
 		}
 
-		partials, err := election.Partials()
+		mixes, err := election.Mixes(s)
+		target := 2 * len(election.Roster.List) / 3
 		if err != nil {
 			return err
-		} else if len(partials) == len(roster.List) {
+		} else if len(mixes) <= target {
+			return errors.New("decrypt error: election not shuffled yet")
+		}
+		partials, err := election.Partials(s)
+
+		if len(partials) >= len(election.Roster.List) {
 			return errors.New("decrypt error: election already decrypted")
-		} else if !election.IsCreator(t.User) {
-			return errors.New("decrypt error: user is not election creator")
+		}
+
+		for _, partial := range partials {
+			if partial.NodeID.Equal(t.Partial.NodeID) {
+				return fmt.Errorf("%s has already proposed a partial", t.Partial.NodeID)
+			}
+		}
+
+		// verify proposer
+		_, proposer := election.Roster.Search(t.Partial.NodeID)
+		if proposer == nil {
+			return errors.New("didn't find node who created the partial")
+		}
+		data, err := proposer.Public.MarshalBinary()
+		if err != nil {
+			return err
+		}
+		err = schnorr.Verify(cothority.Suite, proposer.Public, data, t.Partial.Signature)
+		if err != nil {
+			return err
 		}
 		return nil
 	}
