@@ -120,6 +120,10 @@ func getCommands() cli.Commands {
 							Name:  "e, explicit",
 							Usage: "Display the explicit IP address of the device",
 						},
+						cli.BoolFlag{
+							Name:  "ld, leader",
+							Usage: "Display the leader address",
+						},
 					},
 				},
 				{

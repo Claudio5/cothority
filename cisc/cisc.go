@@ -360,7 +360,11 @@ func scQrcode(c *cli.Context) error {
 		return errors.New("Please chose one of the existing skipchain-ids")
 	}
 	scid := []byte(id.ID)
+
 	address := strings.Split(id.Data.Roster.RandomServerIdentity().Address.NetworkAddress(), ":")
+	if c.Bool("ld") {
+		address = strings.Split(id.Data.Roster.Get(0).Address.NetworkAddress(), ":")
+	}
 
 	// Get our local IP address - this can be different from the public IP
 	// address returned by a service like `whatsmyip`, because we're behind
@@ -1003,8 +1007,8 @@ func followUpdate(c *cli.Context) error {
  */
 
 // Request a Certificate to Letsencrypt Ca and store it in the skipchain
-// It receives as argument the domain name the certificate path where
-// the keys and the fullchain will be stored the and the www path to complete
+// It receives as argument the domain name, the certificate path where
+// the keys and the fullchain will be stored and the www path to complete
 // the challenge
 func certRequest(c *cli.Context) error {
 	cfg := loadConfigOrFail(c)
@@ -1071,7 +1075,7 @@ func certList(c *cli.Context) error {
 				certPath = "Not defined"
 			}
 			public, chain := splitCertPublicChain(v)
-			log.Infof("%s - Expiry Date: %s - Certificate directory: %s", k, certLE.NotAfter, certPath)
+			log.Infof("%s - Expiry	 Date: %s - Certificate directory: %s", k, certLE.NotAfter, certPath)
 			if c.Bool("v") || c.Bool("p") && c.Bool("c") {
 				log.Infof("%s", v)
 			} else if c.Bool("p") {
